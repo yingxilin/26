@@ -424,7 +424,7 @@ def compute_loss(pred_bboxes, gt_bboxes, l1_weight=1.0, iou_weight=2.0):
     return total_loss, l1_loss, iou_loss
 
 
-def extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache):
+def extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache, device='cuda'):
     """使用缓存提取特征"""
     features_list = []
     
@@ -433,6 +433,8 @@ def extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, fe
         if feature_cache is not None:
             cached_features = feature_cache.load_features(image_path)
             if cached_features is not None:
+                # 确保缓存的特征在正确设备上
+                cached_features = cached_features.to(device)
                 features_list.append(cached_features)
                 continue
         
@@ -473,7 +475,7 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
             img_np = (img_np * 255).astype(np.uint8)
             images_np_list.append(img_np)
         
-        features_list = extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache)
+        features_list = extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache, device)
         image_features = torch.cat(features_list, dim=0)  # (B, 256, 64, 64)
         
         # 前向传播
@@ -625,7 +627,7 @@ def evaluate(model, dataloader, hqsam_extractor, device, config, feature_cache=N
                 image_np = (image_np * 255).astype(np.uint8)
                 images_np_list.append(image_np)
             
-            features_list = extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache)
+            features_list = extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache, device)
             image_features = torch.cat(features_list, dim=0)
             
             # 前向传播
