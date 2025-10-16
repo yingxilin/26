@@ -100,12 +100,13 @@ class FungiDataset(Dataset):
             raise ValueError(f"Failed to load image: {image_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
+        gt_bbox = None
         if self.use_parquet_masks:
             # 优先从缓存获取（使用文件名作为键）
             image_key = image_path.name
             cached = self._mask_cache.get(image_key)
             if cached is not None:
-                mask = cached
+                gt_bbox = cached
             else:
                 try:
                     import pyarrow.dataset as ds  # type: ignore
@@ -119,87 +120,68 @@ class FungiDataset(Dataset):
                     requested_cols.append('mask')
                 if self._pa_has_rle:
                     requested_cols.extend(['width', 'height', 'rle'])
-                # 防御：至少要有文件名列
-                if not requested_cols:
-                    mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-                    return {
-                        'image': image,
-                        'mask': mask,
-                        'gt_bbox': self._compute_bbox_from_mask(mask),
-                        'noisy_bbox': self._generate_noisy_bbox(self._compute_bbox_from_mask(mask), image.shape[:2]),
-                        'image_path': str(image_path)
-                    }
-                # 优先按 file_name 精确匹配
                 if self._pa_file_name_field is not None:
                     filter_expr = (ds.field(self._pa_file_name_field) == image_key)
                 else:
                     filter_expr = None
                 table = self._pa_ds.to_table(columns=requested_cols, filter=filter_expr) if filter_expr is not None else self._pa_ds.to_table(columns=requested_cols)
-                # 若未命中，尝试以不带扩展名匹配（某些数据仅存储stem）
                 if table.num_rows == 0 and self._pa_file_name_field is not None:
                     filter_expr2 = (ds.field(self._pa_file_name_field) == image_path.stem)
                     table = self._pa_ds.to_table(columns=requested_cols, filter=filter_expr2)
                 if table.num_rows == 0:
-                    mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                    gt_bbox = None
                 else:
                     cols = {name: table.column(name) for name in table.schema.names}
-                    if self._pa_has_mask and 'mask' in cols:
-                        cell = cols['mask'][0].as_py()
-                        mask_arr = np.asarray(cell)
-                        if mask_arr.ndim == 1:
-                            mask_arr = mask_arr.reshape(image.shape[0], image.shape[1])
-                        elif mask_arr.ndim == 3:
-                            mask_arr = mask_arr[..., 0]
-                        mask = mask_arr.astype(np.uint8)
-                    elif self._pa_has_rle and all(k in cols for k in ['rle', 'width', 'height']):
-                        # 解码RLE为mask
+                    if self._pa_has_rle and all(k in cols for k in ['rle', 'width', 'height']):
                         rle_list = cols['rle'][0].as_py()
                         width_val = int(cols['width'][0].as_py())
                         height_val = int(cols['height'][0].as_py())
-                        # 将 RLE counts 解码为二值掩码，假设从背景开始交替
-                        total = width_val * height_val
-                        flat = np.zeros(total, dtype=np.uint8)
-                        pos = 0
-                        value = 0
-                        for count in rle_list:
-                            if count <= 0:
-                                continue
-                            end = min(pos + int(count), total)
-                            if value == 1:
-                                flat[pos:end] = 1
-                            pos = end
-                            value = 1 - value
-                            if pos >= total:
-                                break
-                        mask_decoded = flat.reshape(height_val, width_val)
-                        # 需要与当前读取图像对齐尺寸
-                        if (height_val, width_val) != (image.shape[0], image.shape[1]):
-                            mask = cv2.resize(mask_decoded, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
-                        else:
-                            mask = mask_decoded.astype(np.uint8)
-                    else:
-                        mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-                # 写入简单缓存
+                        gt_bbox = self._compute_bbox_from_rle_counts(rle_list, width_val, height_val)
+                    elif self._pa_has_mask and 'mask' in cols:
+                        cell = cols['mask'][0].as_py()
+                        mask_arr = np.asarray(cell)
+                        if mask_arr.ndim == 3:
+                            mask_arr = mask_arr[..., 0]
+                        if mask_arr.ndim == 1:
+                            # 1D 情况，按当前图像尺寸重塑
+                            mask_arr = mask_arr.reshape(image.shape[0], image.shape[1])
+                        gt_bbox = self._compute_bbox_from_mask(mask_arr.astype(np.uint8))
+                # 缓存bbox
+                if gt_bbox is None:
+                    gt_bbox = self._compute_bbox_from_mask(np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8))
                 if len(self._mask_cache) >= self._mask_cache_limit:
                     self._mask_cache.pop(next(iter(self._mask_cache)))
-                self._mask_cache[image_key] = mask
+                self._mask_cache[image_key] = gt_bbox
         else:
             mask_path = self.masks_dir / f"{image_path.stem}.png"
             if not mask_path.exists():
                 mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                gt_bbox = self._compute_bbox_from_mask(mask)
             else:
                 mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-
             if mask is None:
                 mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            if gt_bbox is None:
+                gt_bbox = self._compute_bbox_from_mask(mask)
         
-        # 调整图像尺寸
+        # 调整图像尺寸，并按比例缩放 bbox（避免重建整张mask）
+        orig_h, orig_w = image.shape[:2]
         if image.shape[:2] != (self.image_size, self.image_size):
+            sx = self.image_size / orig_w
+            sy = self.image_size / orig_h
             image = cv2.resize(image, (self.image_size, self.image_size))
-            mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+            if gt_bbox is not None:
+                x1, y1, x2, y2 = gt_bbox
+                gt_bbox = np.array([x1 * sx, y1 * sy, x2 * sx, y2 * sy], dtype=np.float32)
+            # 不再需要mask参与训练，提供占位即可
+            mask = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
+        else:
+            # 不使用真实mask以节省CPU时间
+            mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
         
-        # 从mask计算ground truth bbox
-        gt_bbox = self._compute_bbox_from_mask(mask)
+        # 若仍未得到bbox，兜底使用空mask规则
+        if gt_bbox is None:
+            gt_bbox = self._compute_bbox_from_mask(mask)
         
         # 生成noisy bbox (模拟YOLO输出)
         noisy_bbox = self._generate_noisy_bbox(gt_bbox, image.shape[:2])
@@ -211,6 +193,49 @@ class FungiDataset(Dataset):
             'noisy_bbox': noisy_bbox,
             'image_path': str(image_path)
         }
+
+    def _compute_bbox_from_rle_counts(self, counts: List[int], width: int, height: int) -> np.ndarray:
+        """从RLE计数直接计算bbox，避免展开整图。
+        假设counts交替代表0/1像素段长度，起始为0（背景）。
+        """
+        total = width * height
+        pos = 0
+        value = 0
+        min_row, min_col = height, width
+        max_row, max_col = -1, -1
+        for c in counts:
+            if c <= 0:
+                continue
+            if value == 1:
+                start = pos
+                end = min(pos + int(c) - 1, total - 1)
+                # 计算该前景段的行列范围
+                start_row, start_col = divmod(start, width)
+                end_row, end_col = divmod(end, width)
+                # 更新bbox
+                if start_row < min_row:
+                    min_row = start_row
+                if end_row > max_row:
+                    max_row = end_row
+                if start_col < min_col:
+                    min_col = start_col
+                if end_col > max_col:
+                    max_col = end_col
+            pos += int(c)
+            value = 1 - value
+            if pos >= total:
+                break
+        if max_row < 0:
+            # 没有前景
+            center_x, center_y = width // 2, height // 2
+            size = min(width, height) // 10
+            return np.array([center_x - size, center_y - size, center_x + size, center_y + size], dtype=np.float32)
+        # 将行列转为x1,y1,x2,y2
+        x1 = float(min_col)
+        y1 = float(min_row)
+        x2 = float(max_col)
+        y2 = float(max_row)
+        return np.array([x1, y1, x2, y2], dtype=np.float32)
     
     def _compute_bbox_from_mask(self, mask: np.ndarray) -> np.ndarray:
         """从mask计算最小外接矩形"""
@@ -315,15 +340,14 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
         image_paths = batch['image_paths']
         
         # 提取图像特征
-        image_features_list = []
+        # 批量提取特征，减少Python循环开销
+        images_np_list = []
         for i in range(images.shape[0]):
-            image_np = images[i].permute(1, 2, 0).cpu().numpy()
-            image_np = (image_np * 255).astype(np.uint8)
-            features = hqsam_extractor.extract_features(image_np)
-            image_features_list.append(features)
-        
-        # 堆叠特征
-        image_features = torch.cat(image_features_list, dim=0)  # (B, 256, 64, 64)
+            img_np = images[i].permute(1, 2, 0).cpu().numpy()
+            img_np = (img_np * 255).astype(np.uint8)
+            images_np_list.append(img_np)
+        features_list = hqsam_extractor.extract_features_batch(images_np_list)
+        image_features = torch.cat(features_list, dim=0)  # (B, 256, 64, 64)
         
         # 前向传播
         optimizer.zero_grad()
@@ -359,7 +383,7 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
         })
         
         # 可视化（可选）
-        if batch_idx % config['output']['vis_freq'] == 0:
+        if config['output']['vis_freq'] and config['output']['vis_freq'] > 0 and (batch_idx % config['output']['vis_freq'] == 0):
             visualize_batch(model, batch, image_features, hqsam_extractor, 
                           config, epoch, batch_idx)
     
