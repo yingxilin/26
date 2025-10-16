@@ -18,6 +18,10 @@ training:
   lr_scheduler: 'cosine'  # 'cosine', 'step', 'none'
   warmup_epochs: 5
   
+  # 优化功能
+  use_amp: false  # 混合精度训练 (需要支持AMP的GPU)
+  feature_cache: true  # 启用特征缓存
+  
 # 损失函数配置
 loss:
   l1_weight: 1.0
@@ -31,6 +35,9 @@ data:
   data_root: '/path/to/FungiTastic'  # 需要根据实际路径修改
   image_size: 300  # 图像尺寸
   data_subset: 'Mini'  # 'Mini' 或 'Full'
+  
+  # 数据抽样 (优化功能)
+  sample_ratio: null  # 数据抽样比例 (0.0-1.0)，null表示使用全部数据
   
   # 数据增强
   augmentation:
@@ -57,6 +64,20 @@ output:
   save_freq: 5  # 每5个epoch保存一次
   log_freq: 10  # 每10个batch记录一次日志
   vis_freq: 100  # 每100个batch可视化一次
+
+# 优化配置
+optimization:
+  # 特征缓存配置
+  feature_cache:
+    enabled: true  # 启用特征缓存
+    cache_dir: './features'  # 缓存目录
+    auto_detect: true  # 自动检测现有缓存
+  
+  # 性能优化
+  performance:
+    use_amp: false  # 混合精度训练
+    batch_size_multiplier: 1.0  # batch size 乘数 (fast模式)
+    data_sampling: null  # 数据抽样比例 (fast模式)
 
 # 评估配置
 evaluation:
