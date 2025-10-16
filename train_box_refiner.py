@@ -32,7 +32,8 @@ class FungiDataset(Dataset):
     
     def __init__(self, data_root: str, split: str = 'train', 
                  image_size: int = 300, data_subset: str = 'Mini',
-                 augmentation: bool = True, debug: bool = False):
+                 augmentation: bool = True, debug: bool = False,
+                 masks_file: Optional[str] = None):
         """
         Args:
             data_root: 数据集根目录
@@ -49,15 +50,34 @@ class FungiDataset(Dataset):
         self.augmentation = augmentation
         self.debug = debug
         
-        # 构建路径
         self.images_dir = self.data_root / f"{data_subset}" / split / f"{image_size}p"
-        self.masks_dir = self.data_root / f"{data_subset}" / split / "masks"
-        
-        # 检查路径是否存在
-        if not self.images_dir.exists():
-            raise FileNotFoundError(f"Images directory not found: {self.images_dir}")
-        if not self.masks_dir.exists():
-            raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
+
+        # 如提供parquet路径则使用
+        if masks_file:
+            self.masks_path = Path(masks_file)
+            if not self.masks_path.exists():
+                raise FileNotFoundError(f"Masks parquet file not found: {self.masks_path}")
+            self.use_parquet_masks = True
+            # 使用 pyarrow.dataset 进行按需读取，避免一次性加载全表
+            try:
+                import pyarrow.dataset as ds  # type: ignore
+                self._pa_ds = ds.dataset(str(self.masks_path), format='parquet')
+                # 记录可用列
+                self._pa_schema_names = set(self._pa_ds.schema.names)
+                self._pa_has_mask = 'mask' in self._pa_schema_names
+                self._pa_has_rle = all(name in self._pa_schema_names for name in ['rle', 'width', 'height'])
+                self._pa_file_name_field = 'file_name' if 'file_name' in self._pa_schema_names else None
+            except Exception as e:
+                raise RuntimeError(f"Failed to open parquet dataset: {e}")
+            # 简单的最近使用缓存，减少重复IO
+            self._mask_cache = {}
+            self._mask_cache_limit = 1024
+        else:
+            self.masks_dir = self.data_root / f"{data_subset}" / split / "masks"
+            if not self.masks_dir.exists():
+                raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
+            self.use_parquet_masks = False
+
         
         # 获取图像文件列表
         self.image_files = sorted(list(self.images_dir.glob("*.jpg")) + 
@@ -80,13 +100,96 @@ class FungiDataset(Dataset):
             raise ValueError(f"Failed to load image: {image_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # 加载对应的mask
-        mask_path = self.masks_dir / f"{image_path.stem}.png"
-        if not mask_path.exists():
-            # 如果没有对应的mask，创建一个空的
-            mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+        if self.use_parquet_masks:
+            # 优先从缓存获取（使用文件名作为键）
+            image_key = image_path.name
+            cached = self._mask_cache.get(image_key)
+            if cached is not None:
+                mask = cached
+            else:
+                try:
+                    import pyarrow.dataset as ds  # type: ignore
+                except Exception as e:
+                    raise RuntimeError(f"pyarrow is required for parquet reading: {e}")
+                # 仅请求实际存在的列
+                requested_cols = []
+                if self._pa_file_name_field is not None:
+                    requested_cols.append(self._pa_file_name_field)
+                if self._pa_has_mask:
+                    requested_cols.append('mask')
+                if self._pa_has_rle:
+                    requested_cols.extend(['width', 'height', 'rle'])
+                # 防御：至少要有文件名列
+                if not requested_cols:
+                    mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                    return {
+                        'image': image,
+                        'mask': mask,
+                        'gt_bbox': self._compute_bbox_from_mask(mask),
+                        'noisy_bbox': self._generate_noisy_bbox(self._compute_bbox_from_mask(mask), image.shape[:2]),
+                        'image_path': str(image_path)
+                    }
+                # 优先按 file_name 精确匹配
+                if self._pa_file_name_field is not None:
+                    filter_expr = (ds.field(self._pa_file_name_field) == image_key)
+                else:
+                    filter_expr = None
+                table = self._pa_ds.to_table(columns=requested_cols, filter=filter_expr) if filter_expr is not None else self._pa_ds.to_table(columns=requested_cols)
+                # 若未命中，尝试以不带扩展名匹配（某些数据仅存储stem）
+                if table.num_rows == 0 and self._pa_file_name_field is not None:
+                    filter_expr2 = (ds.field(self._pa_file_name_field) == image_path.stem)
+                    table = self._pa_ds.to_table(columns=requested_cols, filter=filter_expr2)
+                if table.num_rows == 0:
+                    mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                else:
+                    cols = {name: table.column(name) for name in table.schema.names}
+                    if self._pa_has_mask and 'mask' in cols:
+                        cell = cols['mask'][0].as_py()
+                        mask_arr = np.asarray(cell)
+                        if mask_arr.ndim == 1:
+                            mask_arr = mask_arr.reshape(image.shape[0], image.shape[1])
+                        elif mask_arr.ndim == 3:
+                            mask_arr = mask_arr[..., 0]
+                        mask = mask_arr.astype(np.uint8)
+                    elif self._pa_has_rle and all(k in cols for k in ['rle', 'width', 'height']):
+                        # 解码RLE为mask
+                        rle_list = cols['rle'][0].as_py()
+                        width_val = int(cols['width'][0].as_py())
+                        height_val = int(cols['height'][0].as_py())
+                        # 将 RLE counts 解码为二值掩码，假设从背景开始交替
+                        total = width_val * height_val
+                        flat = np.zeros(total, dtype=np.uint8)
+                        pos = 0
+                        value = 0
+                        for count in rle_list:
+                            if count <= 0:
+                                continue
+                            end = min(pos + int(count), total)
+                            if value == 1:
+                                flat[pos:end] = 1
+                            pos = end
+                            value = 1 - value
+                            if pos >= total:
+                                break
+                        mask_decoded = flat.reshape(height_val, width_val)
+                        # 需要与当前读取图像对齐尺寸
+                        if (height_val, width_val) != (image.shape[0], image.shape[1]):
+                            mask = cv2.resize(mask_decoded, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+                        else:
+                            mask = mask_decoded.astype(np.uint8)
+                    else:
+                        mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                # 写入简单缓存
+                if len(self._mask_cache) >= self._mask_cache_limit:
+                    self._mask_cache.pop(next(iter(self._mask_cache)))
+                self._mask_cache[image_key] = mask
         else:
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            mask_path = self.masks_dir / f"{image_path.stem}.png"
+            if not mask_path.exists():
+                mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            else:
+                mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+
             if mask is None:
                 mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
         
@@ -270,17 +373,20 @@ def visualize_batch(model, batch, image_features, hqsam_extractor, config, epoch
     # 选择第一个样本进行可视化
     image = batch['images'][0].permute(1, 2, 0).cpu().numpy()
     image = (image * 255).astype(np.uint8)
-    gt_bbox = batch['gt_bboxes'][0].cpu().numpy()
-    noisy_bbox = batch['noisy_bboxes'][0].cpu().numpy()
+    # 训练计算保持为tensor，仅在绘图时转换为numpy
+    gt_bbox_t = batch['gt_bboxes'][0].to(device).float()
+    noisy_bbox_t = batch['noisy_bboxes'][0].to(device).float()
     
     # 获取精炼后的bbox
     with torch.no_grad():
         refined_bbox, history = model.iterative_refine(
-            image_features[0:1], noisy_bbox[None], 
+            image_features[0:1], noisy_bbox_t[None, :],
             (config['data']['image_size'], config['data']['image_size']),
             max_iter=config['refinement']['max_iter']
         )
-        refined_bbox = refined_bbox[0].cpu().numpy()
+        refined_bbox_np = refined_bbox[0].cpu().numpy()
+    gt_bbox = gt_bbox_t.cpu().numpy()
+    noisy_bbox = noisy_bbox_t.cpu().numpy()
     
     # 创建可视化
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -303,7 +409,7 @@ def visualize_batch(model, batch, image_features, hqsam_extractor, config, epoch
     
     # 原始图像 + Refined bbox
     axes[2].imshow(image)
-    refined_rect = plt.Rectangle((refined_bbox[0], refined_bbox[1]), refined_bbox[2]-refined_bbox[0], refined_bbox[3]-refined_bbox[1],
+    refined_rect = plt.Rectangle((refined_bbox_np[0], refined_bbox_np[1]), refined_bbox_np[2]-refined_bbox_np[0], refined_bbox_np[3]-refined_bbox_np[1],
                                 linewidth=2, edgecolor='blue', facecolor='none', label='Refined')
     axes[2].add_patch(refined_rect)
     axes[2].set_title('Refined')
@@ -433,7 +539,8 @@ def main():
         image_size=config['data']['image_size'],
         data_subset=config['data']['data_subset'],
         augmentation=config['data']['augmentation']['enabled'],
-        debug=config['debug']['enabled']
+        debug=config['debug']['enabled'],
+        masks_file=config['data'].get('masks_file')
     )
     
     val_dataset = FungiDataset(
@@ -442,7 +549,8 @@ def main():
         image_size=config['data']['image_size'],
         data_subset=config['data']['data_subset'],
         augmentation=False,
-        debug=config['debug']['enabled']
+        debug=config['debug']['enabled'],
+        masks_file=config['data'].get('masks_file')
     )
     
     # 创建数据加载器
@@ -450,7 +558,7 @@ def main():
         train_dataset, 
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=4,
+        num_workers=0,
         collate_fn=collate_fn
     )
     
@@ -458,7 +566,7 @@ def main():
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=4,
+        num_workers=0,
         collate_fn=collate_fn
     )
     
@@ -482,8 +590,8 @@ def main():
     # 创建优化器
     optimizer = optim.Adam(
         model.parameters(),
-        lr=config['training']['learning_rate'],
-        weight_decay=config['training']['weight_decay']
+        lr=float(config['training']['learning_rate']),
+        weight_decay=float(config['training']['weight_decay'])
     )
     
     # 学习率调度器
