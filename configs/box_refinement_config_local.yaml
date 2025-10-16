@@ -1,0 +1,73 @@
+# Box Refinement 模型配置 - 本地环境适配
+model:
+  hidden_dim: 256
+  num_heads: 8
+  max_offset: 50  # 最大偏移像素
+
+# 迭代配置
+refinement:
+  max_iter: 3
+  stop_threshold: 1.0  # 像素
+
+# 训练配置
+training:
+  batch_size: 8  # 减小batch size以适应4060 GPU
+  epochs: 20
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  lr_scheduler: 'cosine'
+  warmup_epochs: 3
+  
+# 损失函数配置
+loss:
+  l1_weight: 1.0
+  iou_weight: 2.0
+  total_variation_weight: 0.1
+
+# 数据配置 - 根据您的实际路径修改
+data:
+  train_split: 'train'
+  val_split: 'val'
+  data_root: 'D:/search/fungi/26/data/FungiTastic-Mini'  # 修改为您的实际路径
+  image_size: 300
+  data_subset: 'Mini'
+  
+  # 数据增强
+  augmentation:
+    enabled: true
+    rotation_range: 15
+    scale_range: [0.9, 1.1]
+    brightness_range: 0.2
+    noise_std: 0.01
+
+# HQ-SAM 配置 - 根据您的实际路径修改
+hqsam:
+  checkpoint: 'D:/search/fungi/26/data/models/fungitastic_ckpts'  # 修改为您的实际路径
+  model_type: 'hq_vit_h'
+  device: 'cuda'
+
+# 输出配置
+output:
+  save_dir: './outputs/box_refinement'
+  log_dir: './logs/box_refinement'
+  checkpoint_dir: './checkpoints/box_refinement'
+  visualization_dir: './visualizations/box_refinement'
+  
+  # 保存频率
+  save_freq: 5
+  log_freq: 10
+  vis_freq: 50
+
+# 评估配置
+evaluation:
+  metrics: ['iou', 'l1', 'offset_magnitude']
+  val_freq: 1
+  save_predictions: true
+  visualize_samples: 10
+
+# 调试配置
+debug:
+  enabled: false
+  max_samples: 100
+  verbose: true
+  profile: false
