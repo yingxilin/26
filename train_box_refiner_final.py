@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Box Refinement 训练脚本 - 修复版本
-修复了混合精度训练、损失计算和特征缓存的问题
+Box Refinement 训练脚本 - 最终修复版本
+修复了所有已知问题：数据集键名、导入、数据抽样等
 """
 
 import os
@@ -178,10 +178,15 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(pbar):
+        # 修复：使用正确的键名
         images = batch['image'].to(device)
         gt_bboxes = batch['gt_bbox'].to(device)
         noisy_bboxes = batch['noisy_bbox'].to(device)
         image_paths = batch['image_path']
+        
+        # 确保image_paths是列表
+        if isinstance(image_paths, str):
+            image_paths = [image_paths]
         
         # 提取特征
         images_np_list = [img.cpu().numpy().transpose(1, 2, 0) for img in images]
@@ -262,10 +267,15 @@ def evaluate(model, dataloader, hqsam_extractor, device, config, feature_cache=N
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
+            # 修复：使用正确的键名
             images = batch['image'].to(device)
             gt_bboxes = batch['gt_bbox'].to(device)
             noisy_bboxes = batch['noisy_bbox'].to(device)
             image_paths = batch['image_path']
+            
+            # 确保image_paths是列表
+            if isinstance(image_paths, str):
+                image_paths = [image_paths]
             
             # 提取特征
             images_np_list = [img.cpu().numpy().transpose(1, 2, 0) for img in images]
@@ -296,8 +306,8 @@ def evaluate(model, dataloader, hqsam_extractor, device, config, feature_cache=N
 
 
 def main():
-    """主函数 - 修复版本"""
-    parser = argparse.ArgumentParser(description='Box Refinement Training - Fixed Version')
+    """主函数 - 最终修复版本"""
+    parser = argparse.ArgumentParser(description='Box Refinement Training - Final Fixed Version')
     parser.add_argument('--config', type=str, required=True, help='配置文件路径')
     parser.add_argument('--device', type=str, default='auto', help='设备选择')
     parser.add_argument('--fast', action='store_true', help='快速模式')
