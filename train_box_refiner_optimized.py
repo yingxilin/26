@@ -424,7 +424,7 @@ def compute_loss(pred_bboxes, gt_bboxes, l1_weight=1.0, iou_weight=2.0):
     return total_loss, l1_loss, iou_loss
 
 
-def extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache, device):
+def extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, feature_cache, device='cuda'):
     """使用缓存提取特征"""
     features_list = []
     
@@ -433,21 +433,13 @@ def extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, fe
         if feature_cache is not None:
             cached_features = feature_cache.load_features(image_path)
             if cached_features is not None:
-                # 统一到目标设备与dtype
-                if cached_features.device != device:
-                    cached_features = cached_features.to(device)
-                if cached_features.dtype != torch.float32:
-                    cached_features = cached_features.float()
+                # 确保缓存的特征在正确设备上
+                cached_features = cached_features.to(device)
                 features_list.append(cached_features)
                 continue
         
         # 缓存未命中，提取特征
         features = hqsam_extractor.extract_features(image_np)
-        # 统一到目标设备与dtype
-        if features.device != device:
-            features = features.to(device)
-        if features.dtype != torch.float32:
-            features = features.float()
         features_list.append(features)
         
         # 保存到缓存
@@ -488,10 +480,6 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
         
         # 前向传播
         optimizer.zero_grad()
-        
-        # 确保所有输入张量都有梯度信息
-        image_features = image_features.detach().requires_grad_(True)
-        noisy_bboxes = noisy_bboxes.detach().requires_grad_(True)
         
         if use_amp and scaler is not None:
             # 混合精度前向传播
