@@ -45,8 +45,13 @@ class BoxEncoder(nn.Module):
         
         # 归一化坐标到 [0, 1]
         normalized_boxes = bboxes.clone().float()
-        normalized_boxes[:, [0, 2]] /= W  # x坐标归一化
-        normalized_boxes[:, [1, 3]] /= H  # y坐标归一化
+        normalized_boxes = normalized_boxes.clone()
+        # 使用非原地操作以避免 autograd 冲突
+        x_norm = normalized_boxes[:, [0, 2]] / W
+        y_norm = normalized_boxes[:, [1, 3]] / H
+        normalized_boxes = torch.stack(
+            [x_norm[:, 0], y_norm[:, 0], x_norm[:, 1], y_norm[:, 1]], dim=1
+        )
         
         # 计算中心点和宽高
         x1, y1, x2, y2 = normalized_boxes[:, 0], normalized_boxes[:, 1], normalized_boxes[:, 2], normalized_boxes[:, 3]
@@ -195,17 +200,19 @@ class BoxRefinementModule(nn.Module):
             offset = self.forward(image_embedding, current_bbox, img_shape)
             
             # 更新 bbox
-            new_bbox = current_bbox + offset
+            candidate_bbox = current_bbox + offset
             
-            # 边界检查: 确保 bbox 在图像范围内
-            new_bbox[:, 0] = torch.clamp(new_bbox[:, 0], 0, W-1)  # x1
-            new_bbox[:, 1] = torch.clamp(new_bbox[:, 1], 0, H-1)  # y1
-            new_bbox[:, 2] = torch.clamp(new_bbox[:, 2], 0, W-1)  # x2
-            new_bbox[:, 3] = torch.clamp(new_bbox[:, 3], 0, H-1)  # y2
+            # 边界检查: 确保 bbox 在图像范围内（非原地操作）
+            new_x1 = torch.clamp(candidate_bbox[:, 0], 0, W - 1)
+            new_y1 = torch.clamp(candidate_bbox[:, 1], 0, H - 1)
+            new_x2 = torch.clamp(candidate_bbox[:, 2], 0, W - 1)
+            new_y2 = torch.clamp(candidate_bbox[:, 3], 0, H - 1)
             
-            # 确保 x2 > x1, y2 > y1
-            new_bbox[:, 2] = torch.max(new_bbox[:, 2], new_bbox[:, 0] + 1)
-            new_bbox[:, 3] = torch.max(new_bbox[:, 3], new_bbox[:, 1] + 1)
+            # 确保 x2 > x1, y2 > y1（非原地操作）
+            new_x2 = torch.maximum(new_x2, new_x1 + 1)
+            new_y2 = torch.maximum(new_y2, new_y1 + 1)
+            
+            new_bbox = torch.stack([new_x1, new_y1, new_x2, new_y2], dim=1)
             
             # 记录历史
             history.append(new_bbox.clone())

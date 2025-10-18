@@ -1,4 +1,4 @@
-# Box Refinement 模型配置
+# Box Refinement 模型配置 
 model:
   hidden_dim: 256
   num_heads: 8
@@ -17,7 +17,9 @@ training:
   weight_decay: 1e-5
   lr_scheduler: 'cosine'  # 'cosine', 'step', 'none'
   warmup_epochs: 5
-  
+  use_amp: false  # 混合精度训练 (需要支持AMP的GPU)
+  feature_cache: true  # 启用特征缓存
+
 # 损失函数配置
 loss:
   l1_weight: 1.0
@@ -28,22 +30,23 @@ loss:
 data:
   train_split: 'train'
   val_split: 'val'
-  data_root: '/path/to/FungiTastic'  # 需要根据实际路径修改
-  image_size: 300  # 图像尺寸
-  data_subset: 'Mini'  # 'Mini' 或 'Full'
-  
-  # 数据增强
+  data_root: 'D:/search/fungi/26/data/FungiTastic-Mini'  # 需要根据实际路径修改
+  image_size: 300
+  data_subset: ''
+  masks_file: 'D:/search/fungi/26/data/masks/FungiTastic-Mini-TrainMasks.parquet'
+  sample_ratio: 0.1     # ✅ 限制只使用 10% 数据，真正启用 fast 模式
+  num_workers: 8  # ✅ 新增多线程加载，加速数据I/O
   augmentation:
     enabled: true
-    rotation_range: 15  # 旋转角度范围
-    scale_range: [0.9, 1.1]  # 缩放范围
-    brightness_range: 0.2  # 亮度变化范围
-    noise_std: 0.01  # 噪声标准差
+    rotation_range: 15
+    scale_range: [0.9, 1.1]
+    brightness_range: 0.2
+    noise_std: 0.01
 
 # HQ-SAM 配置
 hqsam:
-  checkpoint: '/path/to/hqsam_weights.pth'  # 需要根据实际路径修改
-  model_type: 'vit_h'  # 'vit_h', 'vit_l', 'vit_b'
+  checkpoint: 'D:/search/fungi/26/data/models/fungitastic_ckpts/sam_hq_vit_h.pth'
+  model_type: 'hq_vit_h'
   device: 'cuda'
 
 # 输出配置
@@ -52,22 +55,31 @@ output:
   log_dir: './logs/box_refinement'
   checkpoint_dir: './checkpoints/box_refinement'
   visualization_dir: './visualizations/box_refinement'
-  
-  # 保存频率
-  save_freq: 5  # 每5个epoch保存一次
-  log_freq: 10  # 每10个batch记录一次日志
-  vis_freq: 100  # 每100个batch可视化一次
+  save_freq: 5
+  log_freq: 10
+  vis_freq: 100
+
+# 优化配置
+optimization:
+  feature_cache:
+    enabled: true
+    cache_dir: './features'
+    auto_detect: true
+  performance:
+    use_amp: false
+    batch_size_multiplier: 1.0
+    data_sampling: null
 
 # 评估配置
 evaluation:
   metrics: ['iou', 'l1', 'offset_magnitude']
-  val_freq: 1  # 每个epoch评估一次
+  val_freq: 1
   save_predictions: true
-  visualize_samples: 10  # 可视化样本数量
+  visualize_samples: 10
 
 # 调试配置
 debug:
   enabled: false
-  max_samples: 100  # 调试模式下最大样本数
+  max_samples: 100
   verbose: true
-  profile: false  # 是否进行性能分析
+  profile: false
