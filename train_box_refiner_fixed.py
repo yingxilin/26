@@ -641,7 +641,7 @@ def main():
     # 创建HQ-SAM特征提取器
     print("Loading HQ-SAM feature extractor...")
     hqsam_extractor = create_hqsam_extractor(
-        checkpoint_path=config['hqsam']['checkpoint_path'],
+        checkpoint_path=config['hqsam']['checkpoint'],
         model_type=config['hqsam']['model_type'],
         device=device,
         use_mock=True  # 使用Mock版本进行测试

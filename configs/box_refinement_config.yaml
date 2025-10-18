@@ -1,94 +1,70 @@
-# Box Refinement 模型配置
+data:
+  augmentation:
+    brightness_range: 0.2
+    enabled: true
+    noise_std: 0.01
+    rotation_range: 15
+    scale_range:
+    - 0.9
+    - 1.1
+  data_root: /path/to/FungiTastic
+  data_subset: Mini
+  image_size: 300
+  sample_ratio: null
+  train_split: train
+  val_split: val
+debug:
+  enabled: false
+  max_samples: 100
+  profile: false
+  verbose: true
+evaluation:
+  metrics:
+  - iou
+  - l1
+  - offset_magnitude
+  save_predictions: true
+  val_freq: 1
+  visualize_samples: 10
+hqsam:
+  checkpoint: /path/to/hqsam_weights.pth
+  checkpoint_path: /path/to/hqsam_weights.pth
+  device: cuda
+  model_type: vit_h
+loss:
+  iou_weight: 2.0
+  l1_weight: 1.0
+  total_variation_weight: 0.1
 model:
   hidden_dim: 256
+  max_offset: 50
   num_heads: 8
-  max_offset: 50  # 最大偏移像素
-
-# 迭代配置
+optimization:
+  feature_cache:
+    auto_detect: true
+    cache_dir: ./features
+    enabled: true
+  performance:
+    batch_size_multiplier: 1.0
+    data_sampling: null
+    use_amp: false
+output:
+  checkpoint_dir: ./checkpoints/box_refinement
+  log_dir: ./logs/box_refinement
+  log_freq: 10
+  save_dir: ./outputs/box_refinement
+  save_freq: 5
+  vis_freq: 100
+  visualization_dir: ./visualizations/box_refinement
 refinement:
   max_iter: 3
-  stop_threshold: 1.0  # 像素
-
-# 训练配置
+  stop_threshold: 1.0
 training:
   batch_size: 16
   epochs: 30
+  feature_cache: true
   learning_rate: 1e-4
-  weight_decay: 1e-5
-  lr_scheduler: 'cosine'  # 'cosine', 'step', 'none'
+  lr_scheduler: cosine
+  use_amp: false
   warmup_epochs: 5
-  
-  # 优化功能
-  use_amp: false  # 混合精度训练 (需要支持AMP的GPU)
-  feature_cache: true  # 启用特征缓存
-  
-# 损失函数配置
-loss:
-  l1_weight: 1.0
-  iou_weight: 2.0
-  total_variation_weight: 0.1  # 平滑性正则化
-
-# 数据配置
-data:
-  train_split: 'train'
-  val_split: 'val'
-  data_root: '/path/to/FungiTastic'  # 需要根据实际路径修改
-  image_size: 300  # 图像尺寸
-  data_subset: 'Mini'  # 'Mini' 或 'Full'
-  
-  # 数据抽样 (优化功能)
-  sample_ratio: null  # 数据抽样比例 (0.0-1.0)，null表示使用全部数据
-  
-  # 数据增强
-  augmentation:
-    enabled: true
-    rotation_range: 15  # 旋转角度范围
-    scale_range: [0.9, 1.1]  # 缩放范围
-    brightness_range: 0.2  # 亮度变化范围
-    noise_std: 0.01  # 噪声标准差
-
-# HQ-SAM 配置
-hqsam:
-  checkpoint: '/path/to/hqsam_weights.pth'  # 需要根据实际路径修改
-  model_type: 'vit_h'  # 'vit_h', 'vit_l', 'vit_b'
-  device: 'cuda'
-
-# 输出配置
-output:
-  save_dir: './outputs/box_refinement'
-  log_dir: './logs/box_refinement'
-  checkpoint_dir: './checkpoints/box_refinement'
-  visualization_dir: './visualizations/box_refinement'
-  
-  # 保存频率
-  save_freq: 5  # 每5个epoch保存一次
-  log_freq: 10  # 每10个batch记录一次日志
-  vis_freq: 100  # 每100个batch可视化一次
-
-# 优化配置
-optimization:
-  # 特征缓存配置
-  feature_cache:
-    enabled: true  # 启用特征缓存
-    cache_dir: './features'  # 缓存目录
-    auto_detect: true  # 自动检测现有缓存
-  
-  # 性能优化
-  performance:
-    use_amp: false  # 混合精度训练
-    batch_size_multiplier: 1.0  # batch size 乘数 (fast模式)
-    data_sampling: null  # 数据抽样比例 (fast模式)
-
-# 评估配置
-evaluation:
-  metrics: ['iou', 'l1', 'offset_magnitude']
-  val_freq: 1  # 每个epoch评估一次
-  save_predictions: true
-  visualize_samples: 10  # 可视化样本数量
-
-# 调试配置
-debug:
-  enabled: false
-  max_samples: 100  # 调试模式下最大样本数
-  verbose: true
-  profile: false  # 是否进行性能分析
+  weight_decay: 1e-5
