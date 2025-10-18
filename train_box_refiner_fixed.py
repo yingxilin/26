@@ -180,17 +180,17 @@ class FungiDataset(Dataset):
             mask = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
         else:
             # 不使用真实mask以节省CPU时间
-            mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
-        
-        # 若仍未得到bbox，兜底使用空mask规则
-        if gt_bbox is None:
-            gt_bbox = self._compute_bbox_from_mask(mask)
-        
-        # 生成noisy bbox (模拟YOLO输出)
+            mas        # 生成noisy bbox (模拟YOLO输出)
         noisy_bbox = self._generate_noisy_bbox(gt_bbox, image.shape[:2])
         
         # 🔥 关键修复：归一化边界框坐标到 [0, 1] 范围
         h, w = image.shape[:2]
+        gt_bbox_normalized = gt_bbox / np.array([w, h, w, h], dtype=np.float32)
+        noisy_bbox_normalized = noisy_bbox / np.array([w, h, w, h], dtype=np.float32)
+        
+        # 确保坐标在有效范围内
+        gt_bbox_normalized = np.clip(gt_bbox_normalized, 0.0, 1.0)
+        noisy_bbox_normalized = np.clip(noisy_bbox_normalized, 0.0, 1.0)    h, w = image.shape[:2]
         gt_bbox_normalized = gt_bbox / np.array([w, h, w, h], dtype=np.float32)
         noisy_bbox_normalized = noisy_bbox / np.array([w, h, w, h], dtype=np.float32)
         
@@ -352,21 +352,7 @@ def extract_features_with_cache(hqsam_extractor, images_np_list, image_paths, fe
             if cached_features is not None:
                 # 确保缓存的特征在正确设备上
                 cached_features = cached_features.to(device)
-                features_list.append(cached_features)
-                continue
-        
-        # 缓存未命中，提取特征
-        features = hqsam_extractor.extract_features(image_np)
-        features_list.append(features)
-        
-        # 保存到缓存
-        if feature_cache is not None:
-            feature_cache.save_features(image_path, features)
-    
-    return features_list
-
-
-def compute_loss(pred_bboxes, gt_bboxes, l1_weight=1.0, iou_weight=2.0):
+             def compute_loss(pred_bboxes, gt_bboxes, l1_weight=1.0, iou_weight=0.5):
     """计算损失函数 - 修复版本"""
     # 确保输入张量在相同设备上
     if pred_bboxes.device != gt_bboxes.device:
@@ -378,7 +364,11 @@ def compute_loss(pred_bboxes, gt_bboxes, l1_weight=1.0, iou_weight=2.0):
         pred_bboxes = pred_bboxes[:min_batch]
         gt_bboxes = gt_bboxes[:min_batch]
     
-    # L1损失
+    # 检查输入有效性
+    if pred_bboxes.numel() == 0 or gt_bboxes.numel() == 0:
+        return torch.tensor(0.0, device=pred_bboxes.device), torch.tensor(0.0, device=pred_bboxes.device), torch.tensor(0.0, device=pred_bboxes.device)
+    
+    # L1损失 - 使用更稳定的计算
     l1_loss = F.l1_loss(pred_bboxes, gt_bboxes)
     
     # IoU损失 - 添加数值稳定性
@@ -386,6 +376,15 @@ def compute_loss(pred_bboxes, gt_bboxes, l1_weight=1.0, iou_weight=2.0):
         iou_loss = box_iou_loss(pred_bboxes, gt_bboxes)
         # 检查IoU损失是否为NaN或Inf
         if torch.isnan(iou_loss) or torch.isinf(iou_loss):
+            iou_loss = torch.tensor(0.0, device=pred_bboxes.device)
+    except Exception as e:
+        print(f"Warning: IoU loss computation failed: {e}")
+        iou_loss = torch.tensor(0.0, device=pred_bboxes.device)
+    
+    # 总损失 - 调整权重比例
+    total_loss = l1_weight * l1_loss + iou_weight * iou_loss
+    
+    return total_loss, l1_loss, iou_lossorch.isnan(iou_loss) or torch.isinf(iou_loss):
             iou_loss = torch.tensor(0.0, device=pred_bboxes.device)
     except Exception as e:
         print(f"Warning: IoU loss computation failed: {e}")
@@ -421,19 +420,7 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
         
         # 确保image_paths是列表
         if isinstance(image_paths, str):
-            image_paths = [image_paths]
-        
-        # 提取特征
-        images_np_list = [img.cpu().numpy().transpose(1, 2, 0) for img in images]
-        features_list = extract_features_with_cache(
-            hqsam_extractor, images_np_list, image_paths, feature_cache, device
-        )
-        image_features = torch.cat(features_list, dim=0)  # (B, 256, 64, 64)
-        
-        # 前向传播
-        optimizer.zero_grad()
-        
-        if use_amp and scaler is not None:
+            image_paths = [image_paths]        if use_amp and scaler is not None:
             # 混合精度前向传播
             with torch.cuda.amp.autocast():
                 # 迭代精炼
@@ -452,6 +439,9 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
             
             # 混合精度反向传播
             scaler.scale(loss).backward()
+            # 梯度裁剪
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -460,6 +450,21 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
             refined_bboxes, history = model.iterative_refine(
                 image_features, noisy_bboxes, (config['data']['image_size'], config['data']['image_size']),
                 max_iter=config['refinement']['max_iter'],
+                stop_threshold=config['refinement']['stop_threshold']
+            )
+            
+            # 计算损失
+            loss, l1_loss, iou_loss = compute_loss(
+                refined_bboxes, gt_bboxes,
+                l1_weight=config['loss']['l1_weight'],
+                iou_weight=config['loss']['iou_weight']
+            )
+            
+            # 反向传播
+            loss.backward()
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()'],
                 stop_threshold=config['refinement']['stop_threshold']
             )
             
@@ -615,13 +620,24 @@ def main():
             # 对训练集进行抽样
             train_size = int(len(train_dataset) * sample_ratio)
             train_indices = torch.randperm(len(train_dataset))[:train_size]
-            train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
-            print(f"Sampled {len(train_dataset)} images from {len(train_dataset)} total images (ratio: {sample_ratio})")
-            
-            # 对验证集进行抽样
-            val_size = int(len(val_dataset) * sample_ratio)
-            val_indices = torch.randperm(len(val_dataset))[:val_size]
-            val_dataset = torch.utils.data.Subset(val_dataset, val_indices)
+            train_dat    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=True,
+        num_workers=config['data']['num_workers'],
+        pin_memory=True,
+        persistent_workers=True  # 保持worker进程，减少重启开销
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        num_workers=config['data']['num_workers'],
+        pin_memory=True,
+        persistent_workers=True
+    ) torch.utils.data.Subset(val_dataset, val_indices)
             print(f"Sampled {len(val_dataset)} images from {len(val_dataset)} total images (ratio: {sample_ratio})")
     
     # 创建数据加载器

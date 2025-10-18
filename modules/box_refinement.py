@@ -90,11 +90,6 @@ class SinusoidalPositionalEncoding(nn.Module):
         
         pe = torch.zeros(B, d_model, device=x.device)
         pe[:, 0::2] = torch.sin(position[0::2] * div_term)
-        pe[:, 1::2] = torch.cos(position[1::2] * div_term)
-        
-        return x + pe
-
-
 class OffsetPredictor(nn.Module):
     """预测 bbox 的偏移量"""
     
@@ -105,8 +100,16 @@ class OffsetPredictor(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),  # 增加dropout
             nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 4)  # 输出4个偏移值 [Δx1, Δy1, Δx2, Δy2]
+        )
+        
+        # 初始化最后一层权重为小值
+        nn.init.normal_(self.mlp[-1].weight, std=0.01)
+        nn.init.constant_(self.mlp[-1].bias, 0)near(128, 64),
             nn.ReLU(),
             nn.Linear(64, 4)  # 输出4个偏移值 [Δx1, Δy1, Δx2, Δy2]
         )
@@ -119,20 +122,30 @@ class OffsetPredictor(nn.Module):
             offsets: (B, 4) - [Δx1, Δy1, Δx2, Δy2] 像素单位
         """
         offsets = self.mlp(features)  # (B, 4)
-        
-        # 使用Tanh激活限制偏移范围
-        offsets = torch.tanh(offsets) * self.max_offset
-        
-        return offsets
-
-
-class BoxRefinementModule(nn.Module):
+   class BoxRefinementModule(nn.Module):
     """完整的 Box Refinement 模块"""
     
     def __init__(self, hidden_dim=256, num_heads=8, max_offset=50):
         super().__init__()
         self.box_encoder = BoxEncoder(hidden_dim)
-        self.cross_attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=0.1)
+        self.offset_predictor = OffsetPredictor(hidden_dim, max_offset)
+        self.hidden_dim = hidden_dim
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化模型权重"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.MultiheadAttention):
+                nn.init.xavier_uniform_(module.in_proj_weight)
+                if module.in_proj_bias is not None:
+                    nn.init.constant_(module.in_proj_bias, 0)_heads, batch_first=True)
         self.offset_predictor = OffsetPredictor(hidden_dim, max_offset)
         self.hidden_dim = hidden_dim
     
@@ -279,32 +292,42 @@ def visualize_refinement(image, bbox_history, save_path, gt_bbox=None):
         gt_height = gt_y2 - gt_y1
         gt_rect = patches.Rectangle((gt_x1, gt_y1), gt_width, gt_height,
                                   linewidth=3, edgecolor='purple', facecolor='none',
-                                  linestyle='--', label='Ground Truth')
-        ax.add_patch(gt_rect)
+       def box_iou_loss(pred_boxes, target_boxes):
+    """计算 bbox IoU loss (1 - IoU) - 修复版本"""
+    # 确保输入张量在相同设备上
+    if pred_boxes.device != target_boxes.device:
+        target_boxes = target_boxes.to(pred_boxes.device)
     
-    ax.set_title('Box Refinement Process')
-    ax.legend()
-    ax.axis('off')
+    # 确保输入张量形状一致
+    if pred_boxes.shape != target_boxes.shape:
+        min_batch = min(pred_boxes.shape[0], target_boxes.shape[0])
+        pred_boxes = pred_boxes[:min_batch]
+        target_boxes = target_boxes[:min_batch]
     
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def box_iou_loss(pred_boxes, target_boxes):
-    """计算 bbox IoU loss (1 - IoU)"""
-    def compute_iou(box1, box2):
-        # box1, box2: (4,) - [x1, y1, x2, y2]
-        x1 = torch.max(box1[0], box2[0])
-        y1 = torch.max(box1[1], box2[1])
-        x2 = torch.min(box1[2], box2[2])
-        y2 = torch.min(box1[3], box2[3])
-        
-        intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union = area1 + area2 - intersection
-        
+    # 向量化计算IoU，避免循环
+    # pred_boxes, target_boxes: (B, 4) - [x1, y1, x2, y2]
+    
+    # 计算交集坐标
+    x1 = torch.max(pred_boxes[:, 0], target_boxes[:, 0])  # (B,)
+    y1 = torch.max(pred_boxes[:, 1], target_boxes[:, 1])  # (B,)
+    x2 = torch.min(pred_boxes[:, 2], target_boxes[:, 2])  # (B,)
+    y2 = torch.min(pred_boxes[:, 3], target_boxes[:, 3])  # (B,)
+    
+    # 计算交集面积
+    intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)  # (B,)
+    
+    # 计算各自面积
+    pred_area = (pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1])  # (B,)
+    target_area = (target_boxes[:, 2] - target_boxes[:, 0]) * (target_boxes[:, 3] - target_boxes[:, 1])  # (B,)
+    
+    # 计算并集面积
+    union = pred_area + target_area - intersection  # (B,)
+    
+    # 计算IoU，添加数值稳定性
+    iou = intersection / (union + 1e-7)  # (B,)
+    
+    # 返回平均IoU损失
+    return 1.0 - iou.mean()  # 标量 
         iou = intersection / (union + 1e-6)
         return iou
     
