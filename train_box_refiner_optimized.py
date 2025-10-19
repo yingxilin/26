@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Box Refinement 训练脚本 - 优化版本
-解决训练慢和损失大的问题
+Box Refinement 训练脚本 - 优化版本（已修正：更健壮的空数据集检测与诊断信息）
 """
 
 import os
@@ -13,6 +12,7 @@ import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import logging
+import platform
 
 import torch
 import torch.nn as nn
@@ -67,8 +67,7 @@ class FungiDataset(Dataset):
             self._mask_cache_limit = 1024
         else:
             self.masks_dir = self.data_root / f"{data_subset}" / split / "masks"
-            if not self.masks_dir.exists():
-                raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
+            # 不再在这里直接抛出；但会在后面根据 images_dir 检查综合报错
             self.use_parquet_masks = False
 
         # 获取图像文件列表
@@ -78,6 +77,22 @@ class FungiDataset(Dataset):
         
         if debug:
             self.image_files = self.image_files[:100]
+        
+        # 如果没有找到图像，提供详细的诊断提示并抛出错误（避免 DataLoader 后续崩溃）
+        if len(self.image_files) == 0:
+            expected_img_dir = str(self.images_dir)
+            expected_masks_dir = str(self.masks_dir) if not getattr(self, 'use_parquet_masks', False) else str(self.masks_path)
+            msg_lines = [
+                f"No images found for split '{self.split}'.",
+                f"Expected images directory: {expected_img_dir}",
+                f"Expected masks (dir or parquet): {expected_masks_dir}",
+                "Common causes:",
+                " - config['data']['data_root'], data_subset, image_size or split is incorrect",
+                " - images are stored in a different subfolder than '<data_subset>/<split>/<image_size>p'",
+                " - file extensions differ (e.g. .jpeg) or filenames are not standard",
+                "Please verify your dataset layout and config file."
+            ]
+            raise FileNotFoundError("\n".join(msg_lines))
         
         print(f"Found {len(self.image_files)} images in {self.split} split")
     
@@ -190,11 +205,12 @@ class FungiDataset(Dataset):
         gt_bbox_normalized = np.clip(gt_bbox_normalized, 0.0, 1.0)
         noisy_bbox_normalized = np.clip(noisy_bbox_normalized, 0.0, 1.0)
         
+        # 转为 float32 numpy（DataLoader 默认 collate 会转换为 tensors）
         return {
-            'image': image,
-            'mask': mask,
-            'gt_bbox': gt_bbox_normalized,
-            'noisy_bbox': noisy_bbox_normalized,
+            'image': image.astype(np.float32).transpose(2, 0, 1),  # CHW, float32，便于后续转 torch.tensor
+            'mask': mask.astype(np.uint8),
+            'gt_bbox': gt_bbox_normalized.astype(np.float32),
+            'noisy_bbox': noisy_bbox_normalized.astype(np.float32),
             'image_path': str(image_path)
         }
     
@@ -420,16 +436,17 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
     
     for batch_idx, batch in enumerate(pbar):
         # 获取数据
-        images = batch['image'].to(device)
-        gt_bboxes = batch['gt_bbox'].to(device)
-        noisy_bboxes = batch['noisy_bbox'].to(device)
+        # batch 字段可能是 numpy，需要转换为 torch.tensor
+        images = torch.tensor(batch['image']).to(device)  # (B, C, H, W)
+        gt_bboxes = torch.tensor(batch['gt_bbox']).to(device)
+        noisy_bboxes = torch.tensor(batch['noisy_bbox']).to(device)
         image_paths = batch['image_path']
         
         # 确保image_paths是列表
         if isinstance(image_paths, str):
             image_paths = [image_paths]
         
-        # 提取特征
+        # 将 images 转回 HWC numpy 列表用于特征提取（extractor 接受 HWC numpy）
         images_np_list = [img.cpu().numpy().transpose(1, 2, 0) for img in images]
         features_list = extract_features_with_cache(
             hqsam_extractor, images_np_list, image_paths, feature_cache, device
@@ -513,31 +530,26 @@ def evaluate(model, dataloader, hqsam_extractor, device, config, feature_cache=N
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            # 获取数据
-            images = batch['image'].to(device)
-            gt_bboxes = batch['gt_bbox'].to(device)
-            noisy_bboxes = batch['noisy_bbox'].to(device)
+            images = torch.tensor(batch['image']).to(device)
+            gt_bboxes = torch.tensor(batch['gt_bbox']).to(device)
+            noisy_bboxes = torch.tensor(batch['noisy_bbox']).to(device)
             image_paths = batch['image_path']
             
-            # 确保image_paths是列表
             if isinstance(image_paths, str):
                 image_paths = [image_paths]
             
-            # 提取特征
             images_np_list = [img.cpu().numpy().transpose(1, 2, 0) for img in images]
             features_list = extract_features_with_cache(
                 hqsam_extractor, images_np_list, image_paths, feature_cache, device
             )
             image_features = torch.cat(features_list, dim=0)
             
-            # 前向传播
             refined_bboxes, history = model.iterative_refine(
                 image_features, noisy_bboxes, (config['data']['image_size'], config['data']['image_size']),
                 max_iter=config['refinement']['max_iter'],
                 stop_threshold=config['refinement']['stop_threshold']
             )
             
-            # 计算损失
             loss, l1_loss, iou_loss = compute_loss(
                 refined_bboxes, gt_bboxes,
                 l1_weight=config['loss']['l1_weight'],
@@ -589,7 +601,7 @@ def main():
     print(f"Feature cache detected: {cache_detected}")
     
     # 创建特征缓存
-    feature_cache = FeatureCache(config['output']['checkpoint_dir']) if config['training']['feature_cache'] else None
+    feature_cache = FeatureCache(config['output']['checkpoint_dir']) if config['training'].get('feature_cache', False) else None
     
     # 清空缓存
     if args.clear_cache and feature_cache is not None:
@@ -620,38 +632,65 @@ def main():
     )
     
     # 数据抽样
-    if config['data']['sample_ratio'] is not None:
+    if config['data'].get('sample_ratio') is not None:
         sample_ratio = config['data']['sample_ratio']
         if sample_ratio < 1.0:
             # 对训练集进行抽样
-            train_size = int(len(train_dataset) * sample_ratio)
-            train_indices = torch.randperm(len(train_dataset))[:train_size]
+            original_train_len = len(train_dataset)
+            train_size = int(original_train_len * sample_ratio)
+            if train_size <= 0:
+                raise RuntimeError(f"Sample ratio {sample_ratio} produced zero train samples (original={original_train_len}). "
+                                   "Please check `data.sample_ratio` and dataset content.")
+            train_indices = torch.randperm(original_train_len)[:train_size]
             train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
-            print(f"Sampled {len(train_dataset)} images from {len(train_dataset)} total images (ratio: {sample_ratio})")
+            print(f"Sampled {len(train_dataset)} images from {original_train_len} total images (ratio: {sample_ratio})")
             
             # 对验证集进行抽样
-            val_size = int(len(val_dataset) * sample_ratio)
-            val_indices = torch.randperm(len(val_dataset))[:val_size]
+            original_val_len = len(val_dataset)
+            val_size = int(original_val_len * sample_ratio)
+            if val_size <= 0:
+                raise RuntimeError(f"Sample ratio {sample_ratio} produced zero val samples (original={original_val_len}). "
+                                   "Please check `data.sample_ratio` and dataset content.")
+            val_indices = torch.randperm(original_val_len)[:val_size]
             val_dataset = torch.utils.data.Subset(val_dataset, val_indices)
-            print(f"Sampled {len(val_dataset)} images from {len(val_dataset)} total images (ratio: {sample_ratio})")
+            print(f"Sampled {len(val_dataset)} images from {original_val_len} total images (ratio: {sample_ratio})")
+    
+    # 在创建 DataLoader 之前，再次检查数据集长度（避免 RandomSampler num_samples=0）
+    if len(train_dataset) == 0:
+        raise RuntimeError("Train dataset is empty after sampling. Please check dataset paths and config. "
+                           f"Train data root: {config['data']['data_root']}, subset: {config['data']['data_subset']}, "
+                           f"train_split: {config['data']['train_split']}, image_size: {config['data']['image_size']}")
+    if len(val_dataset) == 0:
+        raise RuntimeError("Validation dataset is empty after sampling. Please check dataset paths and config. "
+                           f"Val data root: {config['data']['data_root']}, subset: {config['data']['data_subset']}, "
+                           f"val_split: {config['data']['val_split']}, image_size: {config['data']['image_size']}")
+    
+    # 兼容 Windows/persistent_workers 设置（Windows 下 persistent_workers True 有时会出问题）
+    num_workers = int(config['data'].get('num_workers', 0))
+    persistent_workers_flag = bool(config['data'].get('persistent_workers', False))
+    if platform.system() == "Windows" and num_workers == 0:
+        persistent_workers_flag = False
+    # 如果 num_workers == 0，也必须禁用 persistent_workers
+    if num_workers == 0:
+        persistent_workers_flag = False
     
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=config['data']['num_workers'],
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=persistent_workers_flag
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=config['data']['num_workers'],
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=persistent_workers_flag
     )
     
     # 创建模型
@@ -686,7 +725,7 @@ def main():
     print(f"Learning rate: {learning_rate}")
     
     # 学习率调度器
-    if config['training']['lr_scheduler'] == 'cosine':
+    if config['training'].get('lr_scheduler') == 'cosine':
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=config['training']['epochs']
         )
@@ -703,7 +742,7 @@ def main():
         # 训练
         train_loss, train_l1, train_iou = train_one_epoch(
             model, train_loader, optimizer, hqsam_extractor, device, epoch, config,
-            feature_cache=feature_cache, use_amp=config['training']['use_amp']
+            feature_cache=feature_cache, use_amp=config['training'].get('use_amp', False)
         )
         
         # 验证
