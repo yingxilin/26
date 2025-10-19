@@ -416,10 +416,15 @@ def compute_loss(pred_bboxes, gt_bboxes, l1_weight=1.0, iou_weight=0.5):
     # 总损失
     total_loss = l1_weight * l1_loss + iou_weight * iou_loss
     
-    return total_loss, l1_loss, iou_loss
-
-
-def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch, config, 
+    return    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    
+    # 添加首批数据加载提示
+    first_batch = True
+    
+    for batch_idx, batch in enumerate(pbar):
+        if first_batch:
+            print(f"  Loading first batch... (this may take a while)")
+            first_batch = Falser, device, epoch, config, 
                    feature_cache=None, use_amp=False):
     """训练一个epoch - 优化版本"""
     model.train()
@@ -434,15 +439,20 @@ def train_one_epoch(model, dataloader, optimizer, hqsam_extractor, device, epoch
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
-    for batch_idx, batch in enumerate(pbar):
-        # 获取数据
-        # batch 字段可能是 numpy，需要转换为 torch.tensor
-        images = torch.tensor(batch['image']).to(device)  # (B, C, H, W)
-        gt_bboxes = torch.tensor(batch['gt_bbox']).to(device)
-        noisy_bboxes = torch.tensor(batch['noisy_bbox']).to(device)
-        image_paths = batch['image_path']
+    for batch_idx, batch in enumerate(pbar):        # 将 images 转回 HWC numpy 列表用于特征提取（extractor 接受 HWC numpy）
+        images_np_list = [img.cpu().numpy().transpose(1, 2, 0) for img in images]
         
-        # 确保image_paths是列表
+        # 特征提取（首次会较慢）
+        if batch_idx == 0:
+            print(f"  Extracting features for first batch...")
+        
+        features_list = extract_features_with_cache(
+            hqsam_extractor, images_np_list, image_paths, feature_cache, device
+        )
+        image_features = torch.cat(features_list, dim=0)
+        
+        if batch_idx == 0:
+            print(f"  Feature extraction completed. Starting training...")s是列表
         if isinstance(image_paths, str):
             image_paths = [image_paths]
         
@@ -657,12 +667,23 @@ def main():
     
     # 在创建 DataLoader 之前，再次检查数据集长度（避免 RandomSampler num_samples=0）
     if len(train_dataset) == 0:
-        raise RuntimeError("Train dataset is empty after sampling. Please check dataset paths and config. "
-                           f"Train data root: {config['data']['data_root']}, subset: {config['data']['data_subset']}, "
-                           f"train_split: {config['data']['train_split']}, image_size: {config['data']['image_size']}")
-    if len(val_dataset) == 0:
-        raise RuntimeError("Validation dataset is empty after sampling. Please check dataset paths and config. "
-                           f"Val data root: {config['data']['data_root']}, subset: {config['data']['data_subset']}, "
+        raise RuntimeError("Train dataset is empty after sampling. Plea    # 兼容 Windows/persistent_workers 设置（Windows 下多进程有时会出问题）
+    num_workers = int(config['data'].get('num_workers', 0))
+    persistent_workers_flag = bool(config['data'].get('persistent_workers', False))
+    
+    # Windows 平台优化：使用较少的workers避免卡死
+    if platform.system() == "Windows":
+        if num_workers > 4:
+            num_workers = 4
+            print(f"Windows detected: reducing num_workers to {num_workers}")
+        # Windows上persistent_workers可能导致问题
+        if num_workers > 0 and persistent_workers_flag:
+            persistent_workers_flag = False
+            print("Windows detected: disabling persistent_workers")
+    
+    # 如果 num_workers == 0，也必须禁用 persistent_workers
+    if num_workers == 0:
+        persistent_workers_flag = False            f"Val data root: {config['data']['data_root']}, subset: {config['data']['data_subset']}, "
                            f"val_split: {config['data']['val_split']}, image_size: {config['data']['image_size']}")
     
     # 兼容 Windows/persistent_workers 设置（Windows 下 persistent_workers True 有时会出问题）
