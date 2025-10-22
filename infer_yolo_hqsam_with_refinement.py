@@ -1,274 +1,394 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-YOLOv8 + HQ-SAM + Box Refinement 完整推理脚本
-在原有pipeline基础上增加Box Refinement模块
-
-Usage:
-    python infer_yolo_hqsam_with_refinement.py \
-        --yolo_weights "runs/detect/fungi_detection/weights/best.pt" \
-        --ckpt_path "D:/search/fungi/26/data/models/fungitastic_ckpts" \
-        --refinement_weights "checkpoints/box_refinement/best_model.pth" \
-        --images_root "D:/search/fungi/26/data/FungiTastic-Mini/val/300p" \
-        --out_masks "D:/search/fungi/26/FungiTastic/out/masks_yolo_hqsam_refined" \
-        --sam_type "hq_vit_h" --conf 0.35 --iou 0.6
+HQ-SAM + YOLOv8 推理脚本（修正版 v12 - 修复 RLE 解码）
 """
 
-import os
-import sys
-import argparse
+import os, sys, cv2, torch, numpy as np
+import pandas as pd
 from pathlib import Path
-from typing import List, Tuple, Optional
-
-# 确保项目根目录在路径中
-_project_root = Path(__file__).resolve().parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
-import numpy as np
-import cv2
-import torch
-from PIL import Image
-from ultralytics import YOLO
 from tqdm import tqdm
+from ultralytics import YOLO
+import gc
 
-# 导入Box Refinement模块
-from modules.box_refinement import BoxRefinementModule, visualize_refinement
-from modules.hqsam_feature_extractor import create_hqsam_extractor
+SAM_HQ_PATH = r"d:\search\fungi\26\sam-hq"
+if SAM_HQ_PATH not in sys.path:
+    sys.path.append(SAM_HQ_PATH)
 
-# 导入原有的HQ-SAM构建函数
-sys.path.append(os.path.join(_project_root, 'segmentation'))
-from hqsam.build_hqsam import build_sam_predictor
+from segment_anything import sam_model_registry
 
+# ========================== 配置 ==========================
+YOLO_WEIGHTS = r"D:\search\fungi\26\FungiTastic\runs\detect\fungi_detection\weights\best.pt"
+SAM_CKPT     = r"D:\search\fungi\26\data\models\fungitastic_ckpts\sam_hq_vit_h.pth"
+IMAGES_ROOT  = r"D:\search\fungi\26\data\FungiTastic-Mini\val\300p"
+GT_PARQUET   = r"D:\search\fungi\26\data\masks\FungiTastic-Mini-ValidationMasks.parquet"
+OUT_ROOT     = r"D:\search\fungi\26_2\26\gaijinout\masksyolo_hqsam_final"
+DEVICE = "cuda"
+YOLO_CONF = 0.35
+BATCH_SIZE = 50
+# =========================================================
 
-def xywh_norm_to_xyxy_abs(xc: float, yc: float, w: float, h: float, img_w: int, img_h: int) -> Tuple[int, int, int, int]:
-    """将归一化坐标转换为绝对坐标"""
-    x_center = xc * img_w
-    y_center = yc * img_h
-    bw = w * img_w
-    bh = h * img_h
-    x1 = int(round(x_center - bw / 2))
-    y1 = int(round(y_center - bh / 2))
-    x2 = int(round(x_center + bw / 2))
-    y2 = int(round(y_center + bh / 2))
-    return max(0, x1), max(0, y1), min(img_w - 1, x2), min(img_h - 1, y2)
-
-
-def run_yolo_batch(model, image_paths: List[Path], conf: float = 0.25, iou: float = 0.45, batch_size: int = 32):
-    """批量运行YOLO检测"""
-    results = []
-    for i in range(0, len(image_paths), batch_size):
-        batch = image_paths[i:i + batch_size]
-        batch_results = model.predict(batch, conf=conf, iou=iou, verbose=False)
-        results.extend(batch_results)
-    return results
+os.makedirs(OUT_ROOT, exist_ok=True)
+LOG_PATH = os.path.join(OUT_ROOT, "inference_log.txt")
 
 
-def masks_postprocess(binary_mask: np.ndarray, min_area_ratio: float = 0.001) -> np.ndarray:
-    """后处理mask，去除小连通区域"""
-    h, w = binary_mask.shape[:2]
-    min_area = int(min_area_ratio * h * w)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((binary_mask > 0).astype(np.uint8), connectivity=8)
-    output = np.zeros((h, w), dtype=np.uint8)
-    for label in range(1, num_labels):
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            output[labels == label] = 255
-    return output
+def rle_decode_fixed(rle_array, height, width):
+    """
+    修复的 RLE 解码
+    RLE 可能的格式：
+    1. [start1, length1, start2, length2, ...] - 从 0 开始的索引
+    2. [start1, length1, start2, length2, ...] - 从 1 开始的索引（COCO 格式）
+    """
+    try:
+        if not isinstance(rle_array, np.ndarray) or len(rle_array) == 0:
+            return None
+        
+        # 确保是偶数长度
+        if len(rle_array) % 2 != 0:
+            return None
+        
+        total_size = height * width
+        mask = np.zeros(total_size, dtype=np.uint8)
+        
+        # 检查是否是 1-indexed（COCO 格式）
+        # 如果第一个 start 是 0，可能是 0-indexed
+        # 如果第一个 start >= 1，可能是 1-indexed
+        first_start = int(rle_array[0])
+        is_one_indexed = first_start >= 1
+        
+        decoded_pixels = 0
+        
+        for i in range(0, len(rle_array), 2):
+            start = int(rle_array[i])
+            length = int(rle_array[i + 1])
+            
+            # 如果是 1-indexed，转换为 0-indexed
+            if is_one_indexed:
+                start = start - 1
+            
+            # 边界检查
+            if start < 0 or length <= 0:
+                continue
+            
+            if start >= total_size:
+                continue
+            
+            end = min(start + length, total_size)
+            mask[start:end] = 255
+            decoded_pixels += (end - start)
+        
+        # 如果解码的像素太少，可能是格式问题
+        if decoded_pixels < 10:
+            return None
+        
+        return mask.reshape(height, width)
+        
+    except Exception as e:
+        return None
 
 
-def save_mask(mask: np.ndarray, out_path: Path):
-    """保存mask图像"""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(mask).save(out_path)
+def normalize_filename(fname):
+    """标准化文件名"""
+    p = Path(fname)
+    stem = p.stem.lower()
+    return stem
+
+
+def load_gt_masks_from_parquet(parquet_path):
+    """从 parquet 加载 GT 掩码"""
+    print(f"📖 Loading GT masks from: {parquet_path}")
+    
+    try:
+        df = pd.read_parquet(parquet_path)
+        print(f"   Total rows: {len(df)}")
+        
+        # 调试：查看第一个 RLE 的内容
+        print(f"\n   🔍 Debugging first RLE:")
+        first_rle = df.iloc[0]['rle']
+        print(f"     Type: {type(first_rle)}")
+        print(f"     Shape: {first_rle.shape if isinstance(first_rle, np.ndarray) else 'N/A'}")
+        print(f"     First 10 values: {first_rle[:10] if isinstance(first_rle, np.ndarray) else 'N/A'}")
+        print(f"     Min/Max: {first_rle.min()}/{first_rle.max() if isinstance(first_rle, np.ndarray) else 'N/A'}")
+        
+        # 按文件名分组
+        gt_dict = {}
+        grouped = df.groupby('file_name')
+        
+        print(f"\n   Processing {len(grouped)} unique images...")
+        
+        success_count = 0
+        fail_count = 0
+        fail_details = {'no_decode': 0, 'empty_mask': 0, 'exception': 0}
+        
+        # 测试前几个
+        test_results = []
+        
+        for idx, (filename, group) in enumerate(tqdm(grouped, desc="   Decoding GT", leave=False)):
+            try:
+                filename_key = normalize_filename(str(filename))
+                
+                first_row = group.iloc[0]
+                H = int(first_row['height'])
+                W = int(first_row['width'])
+                
+                combined_mask = np.zeros((H, W), dtype=np.uint8)
+                part_success = 0
+                part_fail = 0
+                
+                for _, row in group.iterrows():
+                    rle_data = row['rle']
+                    
+                    if isinstance(rle_data, np.ndarray) and len(rle_data) > 0:
+                        part_mask = rle_decode_fixed(rle_data, H, W)
+                        
+                        if part_mask is not None:
+                            combined_mask = np.maximum(combined_mask, part_mask)
+                            part_success += 1
+                        else:
+                            part_fail += 1
+                
+                # 记录测试结果
+                if idx < 5:
+                    test_results.append({
+                        'filename': filename,
+                        'shape': (H, W),
+                        'parts': len(group),
+                        'success': part_success,
+                        'fail': part_fail,
+                        'mask_pixels': int(combined_mask.sum() / 255)
+                    })
+                
+                if combined_mask.max() > 0:
+                    gt_dict[filename_key] = combined_mask
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    if part_success == 0:
+                        fail_details['no_decode'] += 1
+                    else:
+                        fail_details['empty_mask'] += 1
+                    
+            except Exception as e:
+                fail_count += 1
+                fail_details['exception'] += 1
+                continue
+        
+        print(f"\n   ✅ Loaded: {success_count}, Failed: {fail_count}")
+        print(f"   Failure breakdown:")
+        print(f"     - No parts decoded: {fail_details['no_decode']}")
+        print(f"     - Empty after decode: {fail_details['empty_mask']}")
+        print(f"     - Exceptions: {fail_details['exception']}")
+        
+        print(f"\n   Test results (first 5):")
+        for r in test_results:
+            print(f"     {r['filename']}: {r['shape']}, {r['parts']} parts, "
+                  f"{r['success']} success, {r['fail']} fail, {r['mask_pixels']} pixels")
+        
+        if len(gt_dict) > 0:
+            sample_keys = list(gt_dict.keys())[:5]
+            print(f"\n   Sample GT keys: {sample_keys}")
+        
+        return gt_dict
+        
+    except Exception as e:
+        print(f"   ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+
+def compute_iou(pred_mask, gt_mask):
+    """计算 IoU"""
+    p = (pred_mask > 127).astype(np.uint8)
+    g = (gt_mask > 127).astype(np.uint8)
+    inter = np.logical_and(p, g).sum()
+    union = np.logical_or(p, g).sum()
+    return float(inter) / float(union) if union > 0 else 0.0
 
 
 def main():
-    print("Starting YOLOv8 + HQ-SAM + Box Refinement inference...", flush=True)
-    
-    parser = argparse.ArgumentParser(description="YOLOv8 + HQ-SAM + Box Refinement inference")
-    
-    # YOLO参数
-    parser.add_argument("--yolo_weights", required=True, help="Path to YOLOv8 weights .pt")
-    parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
-    parser.add_argument("--iou", type=float, default=0.6, help="YOLO NMS IoU threshold")
-    
-    # HQ-SAM参数
-    parser.add_argument("--ckpt_path", required=True, help="SAM/HQ-SAM checkpoint path or directory")
-    parser.add_argument("--sam_type", default="hq_vit_h", choices=["hq_vit_h", "hq_vit_l", "vit_h", "vit_l"], help="SAM model type")
-    
-    # Box Refinement参数
-    parser.add_argument("--refinement_weights", required=True, help="Path to Box Refinement model weights")
-    parser.add_argument("--refinement_config", help="Path to Box Refinement config file (optional)")
-    parser.add_argument("--max_iter", type=int, default=3, help="Maximum refinement iterations")
-    parser.add_argument("--stop_threshold", type=float, default=1.0, help="Early stopping threshold (pixels)")
-    
-    # 输入输出参数
-    parser.add_argument("--images_root", required=True, help="Directory of images for inference")
-    parser.add_argument("--out_masks", required=True, help="Output directory for masks")
-    parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
-    parser.add_argument("--min_area_ratio", type=float, default=0.001, help="Minimum area ratio for CC filtering")
-    parser.add_argument("--save_individual", action="store_true", help="Save one mask per image")
-    
-    # 可视化参数
-    parser.add_argument("--save_visualizations", action="store_true", help="Save refinement visualizations")
-    parser.add_argument("--vis_dir", help="Directory to save visualizations")
-    
-    args = parser.parse_args()
-    print(f"Arguments parsed successfully", flush=True)
+    device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Device: {device}")
 
-    # 检查输入目录
-    images_dir = Path(args.images_root)
-    if not images_dir.exists():
-        print(f"Error: images_root not found: {images_dir}")
-        sys.exit(1)
+    print("\n🔹 Loading YOLO...")
+    yolo = YOLO(YOLO_WEIGHTS)
+    yolo.to(device).eval()
 
-    image_paths = sorted([*images_dir.glob("*.jpg"), *images_dir.glob("*.JPG"), *images_dir.glob("*.png")])
-    if not image_paths:
-        print(f"No images found under {images_dir}")
-        sys.exit(1)
-    print(f"Found {len(image_paths)} images", flush=True)
+    print("🔹 Loading HQ-SAM...")
+    sam = sam_model_registry["vit_h"](checkpoint=SAM_CKPT).to(device).eval()
 
-    # 加载Box Refinement模型
-    print(f"Loading Box Refinement model from {args.refinement_weights}...", flush=True)
-    refinement_model = BoxRefinementModule(
-        hidden_dim=256,
-        num_heads=8,
-        max_offset=50
-    ).to(args.device)
+    print()
+    gt_masks = {}
+    if Path(GT_PARQUET).exists():
+        gt_masks = load_gt_masks_from_parquet(GT_PARQUET)
+    else:
+        print(f"⚠️ GT not found")
+
+    print("\n🔍 Scanning images...")
     
-    # 加载权重
-    checkpoint = torch.load(args.refinement_weights, map_location=args.device)
-    refinement_model.load_state_dict(checkpoint['model_state_dict'])
-    refinement_model.eval()
-    print("Box Refinement model loaded successfully", flush=True)
-
-    # 加载HQ-SAM特征提取器
-    print(f"Loading HQ-SAM feature extractor...", flush=True)
-    hqsam_extractor = create_hqsam_extractor(
-        checkpoint_path=args.ckpt_path,
-        model_type=args.sam_type,
-        device=args.device,
-        use_mock=False  # 使用真实的HQ-SAM
-    )
-    print("HQ-SAM feature extractor loaded successfully", flush=True)
-
-    # 加载HQ-SAM分割器
-    print(f"Loading HQ-SAM predictor ({args.sam_type})...", flush=True)
-    sam_predictor = build_sam_predictor(args.ckpt_path, sam_type=args.sam_type, device=args.device)
-    print("HQ-SAM predictor loaded successfully", flush=True)
-
-    # 加载YOLO模型
-    print(f"Loading YOLO model from {args.yolo_weights}...", flush=True)
-    yolo_model = YOLO(args.yolo_weights)
-    if args.device:
-        yolo_model.to(args.device)
-    print(f"Running YOLO detection on {len(image_paths)} images...", flush=True)
-    yolo_results = run_yolo_batch(yolo_model, image_paths, conf=args.conf, iou=args.iou, batch_size=32)
-
-    # 创建输出目录
-    out_root = Path(args.out_masks)
-    out_root.mkdir(parents=True, exist_ok=True)
+    image_dict = {}
+    for pattern in ["*.jpg", "*.JPG", "*.png", "*.PNG"]:
+        for p in Path(IMAGES_ROOT).glob(pattern):
+            key = normalize_filename(p.name)
+            if key not in image_dict:
+                image_dict[key] = p
     
-    if args.save_visualizations:
-        vis_dir = Path(args.vis_dir) if args.vis_dir else out_root / "visualizations"
-        vis_dir.mkdir(parents=True, exist_ok=True)
-
-    # 处理每张图像
-    print("Processing images with Box Refinement...", flush=True)
+    image_paths = sorted(image_dict.values(), key=lambda x: x.name)
+    print(f"   Found {len(image_paths)} unique images")
     
-    for img_idx, (img_path, det) in enumerate(tqdm(zip(image_paths, yolo_results), total=len(image_paths))):
-        image_bgr = cv2.imread(str(img_path))
-        if image_bgr is None:
-            print(f"Warning: failed to read {img_path}")
-            continue
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        h, w = image_rgb.shape[:2]
+    if len(gt_masks) > 0:
+        img_keys = set(image_dict.keys())
+        gt_keys = set(gt_masks.keys())
+        matched = img_keys.intersection(gt_keys)
+        
+        print(f"\n   Filename matching:")
+        print(f"     Images: {len(img_keys)}")
+        print(f"     GT masks: {len(gt_keys)}")
+        print(f"     ✅ Matched: {len(matched)}")
 
-        # 设置图像给SAM
-        sam_predictor.set_image(image_rgb)
+    print(f"\n{'='*60}")
+    print(f"🔬 Starting inference...")
+    print(f"{'='*60}\n")
+    
+    ious, strengths = [], []
+    no_detection = 0
+    gt_found = 0
+    failed = 0
 
-        # 收集YOLO检测的boxes
-        boxes_xyxy = []
-        if det is not None and hasattr(det, "boxes") and det.boxes is not None:
+    pbar = tqdm(image_paths, desc="Processing")
+    
+    for idx, img_path in enumerate(pbar):
+        try:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                failed += 1
+                continue
+            
+            H, W = img.shape[:2]
+
+            with torch.no_grad():
+                res = yolo.predict(source=str(img_path), conf=YOLO_CONF, verbose=False)[0]
+                boxes = res.boxes.xyxy.cpu().numpy() if len(res.boxes) > 0 else np.array([])
+
+            if len(boxes) == 0:
+                no_detection += 1
+                cv2.imwrite(str(Path(OUT_ROOT) / img_path.name), np.zeros((H, W), np.uint8))
+                continue
+
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_tensor = torch.as_tensor(img_rgb, device=device).permute(2, 0, 1).float() / 255.0
+            img_1024 = torch.nn.functional.interpolate(
+                img_tensor.unsqueeze(0), size=(1024, 1024), mode="bilinear", align_corners=False
+            )
+
+            with torch.no_grad():
+                encoder_out = sam.image_encoder(img_1024)
+                if isinstance(encoder_out, (tuple, list)):
+                    image_emb = encoder_out[0]
+                    interm_emb = encoder_out[1] if len(encoder_out) > 1 else None
+                else:
+                    image_emb = encoder_out
+                    interm_emb = None
+
+            boxes_1024 = boxes.copy()
+            boxes_1024[:, [0, 2]] *= (1024.0 / W)
+            boxes_1024[:, [1, 3]] *= (1024.0 / H)
+
+            with torch.no_grad():
+                sparse_emb, dense_emb = sam.prompt_encoder(
+                    points=None,
+                    boxes=torch.tensor(boxes_1024, device=device, dtype=torch.float32),
+                    masks=None,
+                )
+                
+                mask_logits, _ = sam.mask_decoder(
+                    image_embeddings=image_emb,
+                    image_pe=sam.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_emb,
+                    dense_prompt_embeddings=dense_emb,
+                    multimask_output=False,
+                    hq_token_only=False,
+                    interm_embeddings=interm_emb,
+                )
+
+            masks = torch.sigmoid(mask_logits).cpu().numpy()
+            
+            combined = np.zeros((256, 256), dtype=np.float32)
+            for m in masks:
+                combined = np.maximum(combined, m[0])
+            
+            combined = cv2.resize(combined, (W, H), interpolation=cv2.INTER_LINEAR)
+            final = (combined * 255).astype(np.uint8)
+            
+            if final.max() > 0:
+                final = cv2.normalize(final, None, 0, 255, cv2.NORM_MINMAX)
+            
+            _, final = cv2.threshold(final, 127, 255, cv2.THRESH_BINARY)
+            
+            cv2.imwrite(str(Path(OUT_ROOT) / img_path.name), final)
+            strengths.append(float(final.mean()))
+
+            key = normalize_filename(img_path.name)
+            if key in gt_masks:
+                gt = gt_masks[key]
+                if gt.shape[:2] != (H, W):
+                    gt = cv2.resize(gt, (W, H), interpolation=cv2.INTER_NEAREST)
+                
+                iou = compute_iou(final, gt)
+                ious.append(iou)
+                gt_found += 1
+            
+            if (idx + 1) % BATCH_SIZE == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+            pbar.set_postfix({
+                'no_det': no_detection,
+                'gt_match': gt_found,
+                'iou': f'{np.mean(ious):.3f}' if ious else 'N/A'
+            })
+
+        except Exception as e:
+            failed += 1
             try:
-                xyxy = det.boxes.xyxy.detach().cpu().numpy()
-                for x1, y1, x2, y2 in xyxy:
-                    x1c = int(max(0, min(w - 1, x1)))
-                    y1c = int(max(0, min(h - 1, y1)))
-                    x2c = int(max(0, min(w - 1, x2)))
-                    y2c = int(max(0, min(h - 1, y2)))
-                    if x2c > x1c and y2c > y1c:
-                        boxes_xyxy.append([x1c, y1c, x2c, y2c])
-            except Exception:
+                cv2.imwrite(str(Path(OUT_ROOT) / img_path.name), np.zeros((H, W), np.uint8))
+            except:
                 pass
-
-        if not boxes_xyxy:
-            # 没有检测到目标，保存空mask
-            empty = np.zeros((h, w), dtype=np.uint8)
-            save_mask(empty, out_root / f"{img_path.stem}.png")
             continue
 
-        # 转换为tensor
-        boxes_t = torch.tensor(boxes_xyxy, device=args.device, dtype=torch.float32)
-        
-        # 使用Box Refinement精炼bbox
-        print(f"Refining {len(boxes_xyxy)} boxes for image {img_idx+1}/{len(image_paths)}...", flush=True)
-        
-        with torch.no_grad():
-            # 提取图像特征
-            image_features = hqsam_extractor.extract_features(image_rgb)  # (1, 256, 64, 64)
-            
-            # 扩展特征以匹配bbox数量
-            if len(boxes_xyxy) > 1:
-                image_features = image_features.repeat(len(boxes_xyxy), 1, 1, 1)  # (B, 256, 64, 64)
-            
-            # 迭代精炼bbox
-            refined_boxes, refinement_history = refinement_model.iterative_refine(
-                image_features, boxes_t, (h, w),
-                max_iter=args.max_iter,
-                stop_threshold=args.stop_threshold
-            )
-            
-            # 转换回CPU numpy数组
-            refined_boxes_np = refined_boxes.cpu().numpy()
-        
-        # 使用精炼后的bbox进行HQ-SAM分割
-        transformed_boxes = sam_predictor.transform.apply_boxes_torch(refined_boxes, (h, w))
+    mean_iou = np.mean(ious) if ious else 0.0
+    median_iou = np.median(ious) if ious else 0.0
+    mean_str = np.mean(strengths) if strengths else 0.0
+    
+    summary = f"""
+{'='*60}
+🎯 Results
+{'='*60}
+Total:              {len(image_paths)}
+Processed:          {len(image_paths) - failed}
+No detection:       {no_detection}
+Failed:             {failed}
+GT matched:         {gt_found}
 
-        with torch.no_grad():
-            masks, scores, _ = sam_predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=False,
-            )
+Mean IoU:           {mean_iou:.4f}
+Median IoU:         {median_iou:.4f}
+Mask intensity:     {mean_str:.2f}
 
-        # 合并实例masks
-        combined = np.zeros((h, w), dtype=np.uint8)
-        for m in masks:
-            m_np = m.squeeze(0).detach().cpu().numpy().astype(np.uint8) * 255
-            combined = np.maximum(combined, m_np)
-
-        # 后处理
-        combined = masks_postprocess(combined, min_area_ratio=args.min_area_ratio)
-        
-        # 保存mask
-        save_path = out_root / f"{img_path.stem}.png"
-        save_mask(combined, save_path)
-        
-        # 保存可视化（如果启用）
-        if args.save_visualizations and len(boxes_xyxy) > 0:
-            # 选择第一个bbox进行可视化
-            bbox_history = [boxes_t[0:1].cpu().numpy()] + [h[0:1].cpu().numpy() for h in refinement_history[1:]]
-            vis_path = vis_dir / f"{img_path.stem}_refinement.png"
-            visualize_refinement(
-                image_rgb, bbox_history, str(vis_path),
-                gt_bbox=None  # 没有ground truth
-            )
-
-    print(f"Inference completed! Masks saved to: {out_root}")
-    if args.save_visualizations:
-        print(f"Visualizations saved to: {vis_dir}")
+Output: {OUT_ROOT}
+{'='*60}
+"""
+    
+    print(f"\n{summary}")
+    
+    with open(LOG_PATH, "w") as f:
+        f.write(summary)
+        if ious:
+            f.write(f"\nIoU Stats:\n")
+            f.write(f"Min:  {np.min(ious):.4f}\n")
+            f.write(f"Max:  {np.max(ious):.4f}\n")
+            f.write(f"Std:  {np.std(ious):.4f}\n")
+    
+    print(f"📝 Log: {LOG_PATH}")
 
 
 if __name__ == "__main__":
